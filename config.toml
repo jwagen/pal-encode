@@ -1,0 +1,5 @@
+log_level = "trace"
+buffer_size = 4440000
+queue_size = 6110000 
+ctrlport_enable = true
+ctrlport_bind = "127.0.0.1:1337"
