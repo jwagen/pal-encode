@@ -1,4 +1,7 @@
 use futuresdr::blocks::Apply;
+use futuresdr::blocks::FirBuilder;
+use futuresdr::futuredsp::firdes;
+use futuresdr::futuredsp::windows::hamming;
 use futuresdr::macros::connect;
 use futuresdr::runtime::Flowgraph;
 use plotters::prelude::*;
@@ -49,14 +52,14 @@ fn plot_samples(data: &[f32]) -> Result<(), Box<dyn Error>> {
 }
 
 //const PIXELS_PER_LINE: usize = 208;
-const PIXELS_PER_LINE: usize = 520;
-//const PIXELS_PER_LINE: usize = 1443;
+//const PIXELS_PER_LINE: usize = 520;
+const PIXELS_PER_LINE: usize = 1443;
 const ACTIVE_PERIOD: f32 = 51.95e-6;
 const PIXEL_FREQUENCY: f32 = PIXELS_PER_LINE as f32 / ACTIVE_PERIOD;
 
 const SCANLINE_PIXELS: usize = FRONT_PORCH + HSYNC_PULSE + PIXELS_PER_LINE + BACK_PORCH;
 
-const SAMPLE_FREQUENCY: f32 = SCANLINE_PIXELS as f32 / 64.0e-6;
+const SAMPLE_FREQUENCY: f64 = SCANLINE_PIXELS as f64 / 64.0e-6;
 
 const FRONT_PORCH: usize = (1.65e-6 * PIXEL_FREQUENCY) as usize;
 const HSYNC_PULSE: usize = (4.7e-6 * PIXEL_FREQUENCY) as usize;
@@ -238,10 +241,142 @@ fn modulate_frame(filename: impl AsRef<Path>) -> Result<Vec<f32>, Box<dyn Error>
 
     //    plot_samples(&buffer)?;
 
-    println!("Sample frequency {}", SAMPLE_FREQUENCY);
-    println!("Pixels in whole scanline {}", SCANLINE_PIXELS);
+    //println!("Sample frequency {}", SAMPLE_FREQUENCY);
+    //println!("Pixels in whole scanline {}", SCANLINE_PIXELS);
 
     Ok(buffer)
+}
+
+struct TeleTextEncoder {
+    data: Vec<u8>
+
+}
+
+impl TeleTextEncoder {
+    fn encode_packet(&mut self) -> Vec<u8> {
+        let mut data = Vec::<u8>::new();
+        
+        // Clock run in
+        data.push(0b01010101);
+
+
+        data
+    }
+
+    fn parity(data: u8) -> u8 {
+        let mut parity = data | 0x80;
+        parity ^= parity >> 4;
+        parity ^= parity >> 2;
+        parity ^= parity >> 1;
+
+        parity & 1
+    }
+
+    // Hamming 8/4 as described in chapter 8.2 ETS 300 706
+    // Encode 4 bit of data in 8 bit using hamming code
+    fn hamming_8_4(data: u8) -> u8 {
+        let d1 = (data>>0) & 1;
+        let d2 = (data>>1) & 1;
+        let d3 = (data>>2) & 1;
+        let d4 = (data>>3) & 1;
+
+        let p1 = 1 ^ d1 ^ d3 ^ d4;
+        let p2 = 1 ^ d1 ^ d2 ^ d4;
+        let p3 = 1 ^ d1 ^ d2 ^ d3;
+        let p4 = 1 ^ p1 ^ d1 ^ p2 ^ d2 ^ p3 ^ d3 ^ d4;
+
+        let ret = (d4  <<1) | p4;
+        let ret = (ret <<1) | d3;
+        let ret = (ret <<1) | p3;
+        let ret = (ret <<1) | d2;
+        let ret = (ret <<1) | p2;
+        let ret = (ret <<1) | d1;
+        let ret = (ret <<1) | p1;
+        
+        ret
+    }
+
+    // Encode magazine and packet number - chapter 7.1.2
+    fn packet_address(magazine: u8, packet_number: u8) -> [u8;2] {
+        // Magazine 0-7, lsb of packet number
+        let packet_1 = (magazine&7) | (packet_number&1)<<3;
+        let packet_1 = Self::hamming_8_4(packet_1);
+
+        // Top bits of packet number
+        let packet_2 = Self::hamming_8_4(packet_number>>1);
+
+        [packet_2, packet_1]
+    }
+
+    // Hamming 24/18
+
+
+}
+#[test]
+fn create_packet_adress() {
+    assert_eq!(TeleTextEncoder::packet_address(0,0), [2,2])
+}
+
+
+struct TeleTextModulator{
+    data: Vec<f32>,
+
+}
+impl TeleTextModulator {
+    const LEVEL_0: f32 = 0.3;
+    const LEVEL_1: f32 = 0.66;
+    fn encode_line(&mut self) {
+
+        // Generate clock run in
+        for _ in 0..8 {
+            self.push_1();
+            self.push_0();
+        }
+        // Framing code
+        self.push_1();
+        self.push_1();
+        self.push_1();
+        self.push_0();
+        self.push_0();
+        self.push_1();
+        self.push_0();
+        self.push_0();
+
+        // Magazine X/ or M/
+
+        // Packet number Y
+
+    }
+
+    // Packet number Y=0
+    fn push_header(&mut self) {
+
+    }
+
+    fn push_byte(&mut self, data: u8) {
+        let mut data = data;
+        for _ in 0..8{
+            if (data & 1) == 1 {
+                self.push_1();
+            }
+            else {
+                self.push_1();
+            }
+
+            data = data>>1;
+        }
+
+    }
+    fn push_0(&mut self) {
+        self.data.push(Self::LEVEL_0);
+
+    }
+
+    fn push_1(&mut self) {
+        self.data.push(Self::LEVEL_1);
+
+    }
+
 }
 
 use futuresdr::anyhow::Result;
@@ -264,6 +399,7 @@ use futuresdr::runtime::StreamIo;
 use futuresdr::runtime::StreamIoBuilder;
 use futuresdr::runtime::WorkIo;
 use futuresdr::blocks::seify;
+use futuresdr::futuredsp::windows;
 struct LumaModulator {
     filename: String,
     frame_counter: u32,
@@ -313,7 +449,7 @@ impl Kernel for LumaModulator {
         let mut buffer = sio.output(0).slice::<f32>();
 
         if buffer.len() >= (SAMPLE_FREQUENCY/25.0) as usize {
-            println!("Starting modulate_frame with filename: {}", self.filename);
+            println!("Modulating frame {} with : {}", self.frame_counter, self.filename);
             let res = modulate_frame(&self.filename).unwrap();
             //dbg!(&res[10000..11000]);
 
@@ -333,6 +469,9 @@ impl Kernel for LumaModulator {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let hardware_decimation = 3;
+    let hardware_interpolation = 2;
+    let hardware_sample_rate: f64 = (SAMPLE_FREQUENCY as f64/hardware_decimation as f64) * hardware_interpolation as f64;
     let c = config::config();
     let luma = LumaModulator::new();
 
@@ -350,19 +489,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let hackrf_sink = seify::SinkBuilder::new()
     //.args("driver=hackrf")?
     .frequency(182.25e6)
-    .sample_rate(10e6)
-    .gain(-40.0)
+    .sample_rate(hardware_sample_rate)
+    .gain(10.0)
     .build().expect("Unable to open sdr hardware");
 
     let float_to_complex = Apply::new(|s: &f32| Complex32::new(*s, 0.0));
 
     let invert = Apply::new(|s: &f32| 1.0-*s);
 
+    //let lp_taps = firdes::kaiser::lowpass::<f32>(8e6/SAMPLE_FREQUENCY as f64, 2e6/SAMPLE_FREQUENCY as f64, 0.1);
+    let lp_taps = firdes::lowpass(6e6/SAMPLE_FREQUENCY, &windows::hamming(6, false));
+    println!("Low pass filter {:?}", &lp_taps);
+    let lp_filter = FirBuilder::new_resampling_with_taps::<Complex32, Complex32, _, _>(hardware_interpolation, hardware_decimation, lp_taps);
+
     //fg.connect_stream(luma, "out", file_sink, "in");
     connect!(fg, 
         //luma > snk; 
         //luma > file_sink;
-        luma > invert > float_to_complex > hackrf_sink;
+        luma > invert > float_to_complex > lp_filter > hackrf_sink;
     );
 
     Runtime::new().run(fg)?;
